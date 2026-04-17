@@ -30,6 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=os.getenv("VENDOR_MODEL", DEFAULT_MODEL_NAME), help="Model name")
     parser.add_argument("--prompt", default=os.getenv("VENDOR_TEST_PROMPT", DEFAULT_PROMPT), help="Prompt to send")
     parser.add_argument("--api-key", default=os.getenv("VENDOR_API_KEY") or os.getenv("DASHSCOPE_API_KEY"), help="API key to use")
+    parser.add_argument("--max-tokens", type=int, default=int(os.getenv("VENDOR_MAX_TOKENS", "4096")), help="Maximum output tokens")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
     parser.add_argument("--traceback", action="store_true", help="Print full traceback on failure")
     return parser
@@ -96,6 +97,7 @@ def main() -> int:
     base_url = (args.base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
     model_name = (args.model or DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
     prompt = args.prompt or DEFAULT_PROMPT
+    max_tokens = max(1, int(args.max_tokens))
     url = f"{base_url.rstrip('/')}/responses"
 
     print("=== DIRECT VENDOR API TEST ===")
@@ -121,12 +123,12 @@ def main() -> int:
         "Authorization": f"Bearer {api_key}",
     }
 
-    verify_tls = not args.insecure
+    verify_ssl = not args.insecure
     if args.insecure:
-        print("Warning: TLS certificate verification is disabled for this run.")
+        print("WARNING: TLS certificate verification is disabled.")
 
     try:
-        with httpx.Client(timeout=60.0, verify=verify_tls) as client:
+        with httpx.Client(timeout=60.0, verify=verify_ssl) as client:
             response = client.post(url, json=body, headers=headers)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
