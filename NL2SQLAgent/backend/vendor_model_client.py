@@ -11,7 +11,7 @@ from langchain_openai import ChatOpenAI
 
 from load_env import load_env_file
 
-DEFAULT_VENDOR_BASE_URL = "https://cpa.ceastar.cn/v1"
+DEFAULT_VENDOR_BASE_URL = "https://cpa.haitim.cn/v1"
 DEFAULT_VENDOR_MODEL = "gpt-5.3-codex"
 
 

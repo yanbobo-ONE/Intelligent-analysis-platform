@@ -5,7 +5,7 @@ from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
 
-DEFAULT_VENDOR_BASE_URL = "https://cpa.ceastar.cn/v1"
+DEFAULT_VENDOR_BASE_URL = "https://cpa.haitim.cn/v1"
 DEFAULT_VENDOR_MODEL = "gpt-5.3-codex"
 
 

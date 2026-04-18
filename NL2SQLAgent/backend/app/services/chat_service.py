@@ -76,6 +76,10 @@ class QueryIntent:
         self.sort_order = sort_order
         self.is_extreme = is_extreme
         self.extreme_type = extreme_type
+        self.position_type: str | None = None
+        self.time_scope: str | None = None
+        self.dimension_hint: str | None = None
+        self.metric_hint: str | None = None
 
 
 def should_use_nl2sql(user_input: str) -> bool:
@@ -179,11 +183,29 @@ def _parse_query_intent(message: str) -> QueryIntent:
     text = (message or '').strip().lower()
     intent = QueryIntent()
 
+    if any(keyword in text for keyword in ('年度', '年终', '年末')):
+        intent.time_scope = 'year'
+    if '销售额' in text or '金额' in text:
+        intent.metric_hint = 'amount'
+    if any(keyword in text for keyword in ('地区', '区域', '各区域', '各地区', '排名')):
+        intent.dimension_hint = 'region'
+    if intent.time_scope == 'year' and intent.metric_hint == 'amount' and any(keyword in text for keyword in ('前', '后', '排名', '最高', '最低')):
+        intent.dimension_hint = 'region'
+
     # 默认排序方向
     if any(keyword in text for keyword in ('从低到高', '最小', '最低', '升序', 'asc')):
         intent.sort_order = 'ASC'
     if any(keyword in text for keyword in ('从高到低', '最大', '最高', '降序', 'desc', '排名靠前', 'top')):
         intent.sort_order = 'DESC'
+
+    # 明确“后 N 条 / 后 N 名”
+    m = re.search(r'(?:后|倒数后)(\d+|[一二两三四五六七八九十]+)(?:条|名|个)?', text)
+    if m:
+        parsed = _cn_number_to_int(m.group(1))
+        if parsed is not None:
+            intent.limit = parsed
+            intent.sort_order = 'ASC'
+            intent.position_type = 'tail_n'
 
     # 单条极值/位置规则
     if re.search(r'(最大|最小|最高|最低)的?(?:那)?(?:条|个|条数据|个数据|条记录|个记录)?', text):
@@ -192,6 +214,7 @@ def _parse_query_intent(message: str) -> QueryIntent:
         intent.limit = 1
     elif any(phrase in text for phrase in ('最后一条', '最后一个', '倒数第一个', '倒数第一条', '末尾一条', '末尾一个', '第一个', '第一条', '第1个', '第1条')):
         intent.limit = 1
+        intent.position_type = 'single'
         if any(phrase in text for phrase in ('末尾', '最小')):
             intent.sort_order = 'ASC'
 
@@ -227,6 +250,103 @@ def _looks_like_analytics_question(message: str) -> bool:
     if len(text) >= 18 and any(token in text for token in ("数据", "表", "字段", "指标", "分组", "按", "查询", "统计", "销售额", "金额")):
         return True
     return False
+
+
+def classify_route(user_input: str) -> str:
+    if _looks_like_analytics_question(user_input):
+        return "NL2SQL"
+    if _looks_like_general_chat(user_input):
+        return "CHAT"
+    return "UNKNOWN"
+
+
+def classify_route_rule_only(user_input: str) -> str:
+    if _looks_like_analytics_question(user_input):
+        return "NL2SQL"
+    if _looks_like_general_chat(user_input):
+        return "CHAT"
+    return "UNKNOWN"
+
+
+def classify_route_with_llm(user_input: str, base_url: str | None = None, api_key: str | None = None) -> str:
+    resolved_api_key = (api_key or os.getenv("VENDOR_API_KEY", os.getenv("DASHSCOPE_API_KEY", ""))).strip()
+    if not resolved_api_key:
+        return "CHAT"
+    classifier_llm = get_vendor_model_from_config(
+        base_url or os.getenv("VENDOR_BASE_URL", "https://cpa.haitim.cn/v1"),
+        "MiniMax-M2.7",
+        resolved_api_key,
+    )
+    prompt = f"""
+你是一个意图分类器，只判断用户是否要查询数据库。
+
+可选标签：
+- NL2SQL：用户想查询数据库、统计、分析、排序、获取数据
+- CHAT：普通对话、问候、自我介绍、无关内容
+
+判断标准：
+1. 只要用户想看数据、查表、统计、排序、找前几条、最后一条、最大最小等，都归为 NL2SQL
+2. 只要是问候、闲聊、介绍自己、无关内容，都归为 CHAT
+
+用户输入：
+{user_input}
+
+只输出一个标签：NL2SQL 或 CHAT
+""".strip()
+    response = classifier_llm.invoke(prompt)
+    label = _llm_content_to_text(getattr(response, "content", "")).strip().upper()
+    return "NL2SQL" if "NL2SQL" in label else "CHAT"
+
+
+def build_nl2sql_prompt(question: str, schema_info: str, intent: QueryIntent) -> str:
+    order_word = '降序' if intent.sort_order == 'DESC' else '升序'
+    extreme_text = '是' if intent.is_extreme else '否'
+    time_scope_text = intent.time_scope or 'none'
+    dimension_text = intent.dimension_hint or 'none'
+    metric_text = intent.metric_hint or 'none'
+    return f"""
+你是一个 NL2SQL 组件，请只输出 SQL，不要解释。
+
+数据库表结构：
+{schema_info}
+
+用户问题：
+{question}
+
+解析意图：
+- 结果条数：{intent.limit}
+- 排序方向：{intent.sort_order}
+- 极值模式：{extreme_text}
+- 极值类型：{intent.extreme_type or 'none'}
+- 单条位置模式：{intent.position_type or 'none'}
+- 时间范围：{time_scope_text}
+- 维度提示：{dimension_text}
+- 指标提示：{metric_text}
+
+输出要求：
+1. 只输出 SQLite SELECT SQL
+2. 需要包含 GROUP BY
+3. 需要按金额{order_word}
+4. 只返回前 {intent.limit} 条
+5. 如果时间范围提示为 year 且维度提示为 region，则默认按 region 分组，不要按 year 分组，除非用户明确要求按年份统计
+6. 如果时间范围是 year，优先按年度条件或年度汇总理解
+7. 如果维度提示是 region，优先按 region 作为分组维度
+8. 如果指标提示是 amount，优先按 amount / SUM(amount) 作为排序指标
+""".strip()
+
+
+def normalize_sql(generated_sql: str, intent: QueryIntent) -> str:
+    sql = (generated_sql or '').strip().strip("```sql").strip("```").strip()
+    if intent.limit:
+        if re.search(r"(?i)\blimit\s+\d+\b", sql):
+            sql = re.sub(r"(?i)\blimit\s+\d+\b", f"LIMIT {intent.limit}", sql)
+        elif re.search(r";\s*$", sql):
+            sql = re.sub(r";\s*$", f" LIMIT {intent.limit};", sql)
+        else:
+            sql = f"{sql} LIMIT {intent.limit}"
+    if intent.sort_order and not re.search(r"(?i)\border\s+by\b", sql):
+        sql = f"{sql} ORDER BY amount {intent.sort_order}"
+    return sql
 
 
 def save_message(session_id: str, role: str, content: str) -> None:
@@ -277,6 +397,28 @@ def _get_chat_llm(model_name: str | None = None, base_url: str | None = None, ap
     return get_qwen_model()
 
 
+def should_use_annual_region_ranking_template(question: str, intent: QueryIntent) -> bool:
+    text = (question or '').strip().lower()
+    has_year_scope = any(k in text for k in ('年度', '年终', '年末'))
+    has_metric = any(k in text for k in ('销售额', '金额'))
+    has_ranking = any(k in text for k in ('前', '后', '最后', '排名', '最高', '最低'))
+    explicit_year_grouping = any(k in text for k in ('按年份', '每年', '各年份', '按年分组', '年份统计'))
+    return has_year_scope and has_metric and has_ranking and not explicit_year_grouping and intent.dimension_hint == 'region'
+
+
+def build_annual_region_ranking_sql(intent: QueryIntent) -> str:
+    order = 'ASC' if intent.sort_order == 'ASC' else 'DESC'
+    limit = intent.limit or 3
+    return f"""
+SELECT region, SUM(amount) AS total_amount
+FROM sales_demo
+WHERE strftime('%Y', created_at) = strftime('%Y', 'now')
+GROUP BY region
+ORDER BY total_amount {order}
+LIMIT {limit};
+""".strip()
+
+
 def build_nl2sql_response(question: str, model_name: str | None = None, base_url: str | None = None, api_key: str | None = None) -> dict[str, Any]:
     start = perf_counter()
     llm = _get_chat_llm(model_name=model_name, base_url=base_url, api_key=api_key)
@@ -285,43 +427,13 @@ def build_nl2sql_response(question: str, model_name: str | None = None, base_url
     schema_info = db.get_table_info()
     intent = _parse_query_intent(question)
     limit_hint = intent.limit
-    sort_order = intent.sort_order
-    extreme_clause = ''
-    if intent.is_extreme:
-        extreme_clause = '，并返回单条极值记录'
 
-    prompt = f"""
-你是一个 NL2SQL 组件，请只输出 SQL，不要解释。
-
-数据库表结构：
-{schema_info}
-
-问题：{question}
-
-解析意图：
-- 结果条数：{limit_hint}
-- 排序方向：{sort_order}
-- 极值模式：{'是' if intent.is_extreme else '否'}{extreme_clause}
-
-输出要求：
-1. 只输出 SQLite SELECT SQL
-2. 需要包含 GROUP BY
-3. 需要按金额{('降序' if sort_order == 'DESC' else '升序')}
-4. 只返回前 {limit_hint} 条
-""".strip()
-
-    sql_response = llm.invoke(prompt)
-    generated_sql = _llm_content_to_text(getattr(sql_response, 'content', '')).strip().strip("```sql").strip("```").strip()
-    if limit_hint:
-        if re.search(r"(?i)\blimit\s+\d+\b", generated_sql):
-            generated_sql = re.sub(r"(?i)\blimit\s+\d+\b", f"LIMIT {limit_hint}", generated_sql)
-        elif re.search(r";\s*$", generated_sql):
-            generated_sql = re.sub(r";\s*$", f" LIMIT {limit_hint};", generated_sql)
-        else:
-            generated_sql = f"{generated_sql} LIMIT {limit_hint}"
-
-    if intent.is_extreme and intent.sort_order == 'ASC':
-        generated_sql = re.sub(r'ORDER\s+BY\s+[^\n]+DESC', 'ORDER BY total_amount ASC', generated_sql, flags=re.IGNORECASE)
+    if should_use_annual_region_ranking_template(question, intent):
+        generated_sql = build_annual_region_ranking_sql(intent)
+    else:
+        prompt = build_nl2sql_prompt(question, schema_info, intent)
+        sql_response = llm.invoke(prompt)
+        generated_sql = normalize_sql(_llm_content_to_text(getattr(sql_response, 'content', '')), intent)
 
     validate_readonly_sql(generated_sql)
     rows = db.run(generated_sql)
@@ -401,10 +513,11 @@ def build_general_response(message: str, model_name: str | None = None, base_url
 
 
 def build_response(message: str, model_name: str | None = None, base_url: str | None = None, api_key: str | None = None, session_id: str | None = None) -> dict:
-    analytics = _looks_like_analytics_question(message)
-    general = _looks_like_general_chat(message)
-    print(f'[chat_service] message={message!r} analytics={analytics} general={general}')
-    if analytics:
+    route = classify_route_rule_only(message)
+    if route == "UNKNOWN":
+        route = classify_route_with_llm(message, base_url=base_url, api_key=api_key)
+    print(f'[chat_service] message={message!r} route={route}')
+    if route == "NL2SQL":
         print('[chat_service] branch=nl2sql')
         return build_nl2sql_response(message, model_name=model_name, base_url=base_url, api_key=api_key)
     print('[chat_service] branch=general')

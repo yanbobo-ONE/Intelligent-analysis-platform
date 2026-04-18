@@ -69,7 +69,7 @@ const MODEL_OPTIONS: ModelOption[] = [
 ];
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
-const DEFAULT_VENDOR_BASE_URL = 'https://cpa.ceastar.cn/v1';
+const DEFAULT_VENDOR_BASE_URL = 'https://cpa.haitim.cn/v1';
 
 function maskSecret(value: string) {
   if (!value) return '';
